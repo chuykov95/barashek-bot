@@ -27,10 +27,10 @@ YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "YOUR_SECRET_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot")
 
 # Админ — может добавлять/удалять сотрудников
-ADMIN_ID = int(os.getenv("ADMIN_ID", "925771354"))
+ADMIN_ID = 925771354
 
 # Путь к базе данных
-DB_PATH = os.getenv("DB_PATH", "payments.db")
+DB_PATH = "payments.db"
 
 # Таймаут ожидания оплаты (секунды)
 PAYMENT_TIMEOUT = 600  # 10 минут
@@ -377,15 +377,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Unauthorized access attempt: {user.id} ({get_user_display_name(user)})")
         return
 
-await update.message.reply_text(
-        f"👋 Привет, {user.first_name}!\n\n"
-        "Я бот для создания ссылок на оплату.\n\n"
-        "📌 <b>Быстрый старт:</b>\n"
-        "• Нажми «💳 Создать платёж»\n"
-        "• Или введи: /pay 500 Пицца Маргарита\n\n"
-        "Когда клиент оплатит — я пришлю уведомление ✅",
-        parse_mode="HTML",
-        reply_markup=menu_for(user.id),
+    await update.message.reply_text(
+      f"👋 Привет, {user.first_name}!\n\n"
+      "Я бот для создания ссылок на оплату.\n\n"
+      "📌 <b>Быстрый старт:</b>\n"
+      "• Нажми «💳 Создать платёж»\n"
+      "• Или введи: /pay 500 Пицца Маргарита\n\n"
+      "Когда клиент оплатит — я пришлю уведомление ✅",
+      parse_mode="HTML",
+      reply_markup=menu_for(user.id),
     )
 
 
