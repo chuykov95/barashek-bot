@@ -298,7 +298,8 @@ async def check_payment_loop(payment_id: str, chat_id: int, bot):
 
     for attempt in range(checks):
         try:
-            yoo_payment = Payment.find_one(payment_id)
+            loop = asyncio.get_running_loop()
+            yoo_payment = await loop.run_in_executor(None, Payment.find_one, payment_id)
             status = yoo_payment.status
 
             if status == "succeeded":
