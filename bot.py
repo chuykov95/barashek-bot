@@ -1,3 +1,5 @@
+from telegram.ext import ApplicationBuilder
+import httpx
 import uuid
 import asyncio
 import logging
@@ -25,6 +27,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_TOKEN")
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID", "YOUR_SHOP_ID")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY", "YOUR_SECRET_KEY")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "your_bot")
+TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
 
 # Админ — может добавлять/удалять сотрудников
 ADMIN_ID = 925771354
@@ -966,14 +969,17 @@ def main():
     logger.info(f"Admin ID: {ADMIN_ID}")
     logger.info(f"Database: {DB_PATH}")
     logger.info(f"Payment timeout: {PAYMENT_TIMEOUT}s")
+    if TELEGRAM_PROXY_URL:
+        logger.info(f"Proxy: {TELEGRAM_PROXY_URL}")
     logger.info("=" * 50)
 
-    app = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
+    # ✅ Настройка с прокси
+    builder = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init)
+
+    if TELEGRAM_PROXY_URL:
+        builder = builder.proxy(TELEGRAM_PROXY_URL).get_updates_proxy(TELEGRAM_PROXY_URL)
+
+    app = builder.build()
 
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
@@ -993,10 +999,10 @@ def main():
     # Inline-кнопки
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Текстовые сообщения (кнопки меню + свободный ввод)
+    # Текстовые сообщения
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_buttons))
 
-    # Глобальный обработчик ошибок
+    # Ошибки
     app.add_error_handler(error_handler)
 
     logger.info("🤖 Bot is running. Press Ctrl+C to stop.")
