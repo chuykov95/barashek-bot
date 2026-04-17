@@ -4,3 +4,4 @@ fastapi==0.115.0
 uvicorn==0.32.0
 pydantic==2.10.0
 httpx[socks]
+psutil==6.1.0

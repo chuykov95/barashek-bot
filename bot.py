@@ -6,8 +6,10 @@ import logging
 import sqlite3
 import os
 import signal
+import weakref
 from datetime import datetime, timedelta
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
+from typing import Dict, Set, Optional
 
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
@@ -62,22 +64,170 @@ logger = logging.getLogger("PaymentBot")
 
 
 # ===================================================
-# БАЗА ДАННЫХ
+# УПРАВЛЕНИЕ ЗАДАЧАМИ И РЕСУРСАМИ
+# ===================================================
+class TaskManager:
+    """Управляет фоновыми задачами для предотвращения утечек и зависаний."""
+    
+    def __init__(self):
+        self._active_tasks: Set[asyncio.Task] = set()
+        self._payment_watchers: Dict[str, asyncio.Task] = {}
+        self._max_concurrent_watchers = 50
+        self._api_semaphore = asyncio.Semaphore(10)  # Ограничение одновременных API запросов
+        
+    def create_payment_watcher(self, payment_id: str, chat_id: int, bot):
+        """Создает задачу отслеживания платежа с контролем ресурсов."""
+        if payment_id in self._payment_watchers:
+            # Проверяем, не завершена ли старая задача
+            old_task = self._payment_watchers[payment_id]
+            if old_task.done():
+                del self._payment_watchers[payment_id]
+            else:
+                logger.warning(f"Payment watcher for {payment_id} already exists")
+                return None
+        
+        if len(self._payment_watchers) >= self._max_concurrent_watchers:
+            logger.error("Maximum concurrent payment watchers reached")
+            return None
+            
+        task = asyncio.create_task(
+            check_payment_loop_safe(payment_id, chat_id, bot, self)
+        )
+        self._payment_watchers[payment_id] = task
+        self._active_tasks.add(task)
+        
+        # Очистка завершенных задач
+        task.add_done_callback(lambda t: self._cleanup_task(t, payment_id))
+        
+        return task
+    
+    def _cleanup_task(self, task: asyncio.Task, payment_id: str = None):
+        """Очищает завершенные задачи."""
+        self._active_tasks.discard(task)
+        if payment_id and payment_id in self._payment_watchers:
+            del self._payment_watchers[payment_id]
+    
+    async def cancel_payment_watcher(self, payment_id: str):
+        """Отменяет задачу отслеживания платежа."""
+        if payment_id in self._payment_watchers:
+            task = self._payment_watchers[payment_id]
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task(task, payment_id)
+            return True
+        return False
+    
+    async def shutdown(self):
+        """Завершает все фоновые задачи."""
+        logger.info("Shutting down task manager...")
+        
+        # Отменяем все задачи
+        for task in list(self._active_tasks):
+            task.cancel()
+        
+        # Ждем завершения с таймаутом
+        if self._active_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._active_tasks, return_exceptions=True),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Some tasks didn't finish gracefully")
+        
+        self._active_tasks.clear()
+        self._payment_watchers.clear()
+        logger.info("Task manager shutdown complete")
+    
+    async def with_api_semaphore(self, coro):
+        """Выполняет корутину с ограничением одновременных API запросов."""
+        async with self._api_semaphore:
+            return await coro
+    
+    def get_stats(self):
+        """Возвращает статистику по задачам."""
+        return {
+            "active_tasks": len(self._active_tasks),
+            "payment_watchers": len(self._payment_watchers),
+            "max_watchers": self._max_concurrent_watchers
+        }
+
+
+# Глобальный менеджер задач
+task_manager = TaskManager()
+
+
+# ===================================================
+# БАЗА ДАННЫХ С УЛУЧШЕННОЙ ОБРАБОТКОЙ
 # ===================================================
 class Database:
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._connection_pool = []
+        self._pool_size = 5
+        self._lock = asyncio.Lock()
         self._init_db()
+        
+    async def get_connection(self):
+        """Получает соединение из пула."""
+        async with self._lock:
+            if self._connection_pool:
+                return self._connection_pool.pop()
+            else:
+                # Создаем новое соединение в отдельном потоке
+                loop = asyncio.get_running_loop()
+                conn = await loop.run_in_executor(None, self._create_connection)
+                return conn
+    
+    async def return_connection(self, conn):
+        """Возвращает соединение в пул."""
+        async with self._lock:
+            if len(self._connection_pool) < self._pool_size:
+                self._connection_pool.append(conn)
+            else:
+                await self._close_connection(conn)
+    
+    def _create_connection(self):
+        """Создает новое соединение с базой данных."""
+        conn = sqlite3.connect(self.db_path, timeout=30.0)  # Увеличенный таймаут
+        conn.row_factory = sqlite3.Row
+        # Включаем WAL режим для лучшей concurrency
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=10000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        return conn
+    
+    async def _close_connection(self, conn):
+        """Закрывает соединение."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, conn.close)
 
     @contextmanager
     def _connect(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
+        """Синхронный контекст для обратной совместимости."""
+        conn = self._create_connection()
         try:
             yield conn
             conn.commit()
         finally:
             conn.close()
+    
+    @asynccontextmanager
+    async def async_connect(self):
+        """Асинхронный контекст для работы с БД."""
+        conn = await self.get_connection()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            await self.return_connection(conn)
 
     def _init_db(self):
         with self._connect() as conn:
@@ -293,17 +443,42 @@ def get_user_display_name(user) -> str:
 
 
 # ===================================================
-# ПРОВЕРКА ОПЛАТЫ (фоновая задача)
+# ПРОВЕРКА ОПЛАТЫ (улучшенная версия)
 # ===================================================
-async def check_payment_loop(payment_id: str, chat_id: int, bot):
-    """Периодически проверяет статус платежа в ЮKassa."""
+async def check_payment_with_timeout(func, *args, timeout=30):
+    """Выполняет функцию с таймаутом."""
+    try:
+        loop = asyncio.get_running_loop()
+        return await asyncio.wait_for(
+            loop.run_in_executor(None, func, *args),
+            timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"API call timeout after {timeout}s")
+        raise
+    except Exception as e:
+        logger.error(f"API call error: {e}")
+        raise
+
+
+async def check_payment_loop_safe(payment_id: str, chat_id: int, bot, task_mgr: TaskManager):
+    """Безопасная проверка статуса платежа с управлением ошибками."""
     checks = PAYMENT_TIMEOUT // PAYMENT_CHECK_INTERVAL
+    consecutive_errors = 0
+    max_consecutive_errors = 3
 
     for attempt in range(checks):
         try:
-            loop = asyncio.get_running_loop()
-            yoo_payment = await loop.run_in_executor(None, Payment.find_one, payment_id)
-            status = yoo_payment.status
+            # Проверяем, не была ли задача отменена
+            if asyncio.current_task().cancelled():
+                logger.info(f"Payment watcher for {payment_id} was cancelled")
+                return
+
+            # Используем семафор для ограничения одновременных запросов
+            async with task_mgr._api_semaphore:
+                yoo_payment = await check_payment_with_timeout(Payment.find_one, payment_id)
+                status = yoo_payment.status
+                consecutive_errors = 0  # Сбрасываем счетчик ошибок
 
             if status == "succeeded":
                 db.update_payment_status(payment_id, "succeeded")
@@ -346,26 +521,63 @@ async def check_payment_loop(payment_id: str, chat_id: int, bot):
                 logger.info(f"Payment {payment_id} canceled")
                 return
 
+        except asyncio.CancelledError:
+            logger.info(f"Payment watcher for {payment_id} cancelled")
+            return
         except Exception as e:
-            logger.warning(f"Check error for {payment_id} (attempt {attempt+1}): {e}")
-            # Не прерываем — попробуем снова
+            consecutive_errors += 1
+            logger.warning(f"Check error for {payment_id} (attempt {attempt+1}, error {consecutive_errors}/{max_consecutive_errors}): {e}")
+            
+            # Если слишком много ошибок подряд, прекращаем попытки
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error(f"Too many consecutive errors for {payment_id}, stopping watcher")
+                db.update_payment_status(payment_id, "canceled")
+                try:
+                    p = db.get_payment(payment_id)
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"⚠️ <b>Проблемы с проверкой платежа</b>\n\n"
+                            f"💰 {p['amount']:.2f} ₽ — {p['description']}\n"
+                            f"Проверьте статус вручную: /status {payment_id}\n"
+                            f"🆔 <code>{payment_id}</code>"
+                        ),
+                        parse_mode="HTML",
+                    )
+                except Exception as send_error:
+                    logger.error(f"Failed to send error message: {send_error}")
+                return
 
-        await asyncio.sleep(PAYMENT_CHECK_INTERVAL)
+        # Используем asyncio.wait_for для прерываемого сна
+        try:
+            await asyncio.wait_for(asyncio.sleep(PAYMENT_CHECK_INTERVAL), timeout=PAYMENT_CHECK_INTERVAL + 1)
+        except asyncio.CancelledError:
+            return
 
     # Таймаут
     db.update_payment_status(payment_id, "expired")
     p = db.get_payment(payment_id)
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text=(
-            f"⏰ <b>Платёж не оплачен</b> (прошло {PAYMENT_TIMEOUT // 60} мин)\n\n"
-            f"💰 {p['amount']:.2f} ₽ — {p['description']}\n"
-            f"🆔 <code>{payment_id}</code>"
-        ),
-        parse_mode="HTML",
-    )
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"⏰ <b>Платёж не оплачен</b> (прошло {PAYMENT_TIMEOUT // 60} мин)\n\n"
+                f"💰 {p['amount']:.2f} ₽ — {p['description']}\n"
+                f"🆔 <code>{payment_id}</code>"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"Failed to send timeout message: {e}")
+    
     logger.info(f"Payment {payment_id} expired")
+
+
+async def check_payment_loop(payment_id: str, chat_id: int, bot):
+    """Обратная совместимость - используем новый безопасный метод."""
+    task = task_manager.create_payment_watcher(payment_id, chat_id, bot)
+    return task
 
 
 # ===================================================
@@ -474,22 +686,26 @@ async def cmd_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        yoo_payment = Payment.create(
-            {
-                "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
-                "confirmation": {
-                    "type": "redirect",
-                    "return_url": f"https://t.me/{BOT_USERNAME}",
+        loop = asyncio.get_running_loop()
+        yoo_payment = await loop.run_in_executor(
+            None,
+            lambda: Payment.create(
+                {
+                    "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
+                    "confirmation": {
+                        "type": "redirect",
+                        "return_url": f"https://t.me/{BOT_USERNAME}",
+                    },
+                    "capture": True,
+                    "description": description,
+                    "metadata": {
+                        "created_by": str(user.id),
+                        "created_by_name": user_name,
+                        "bot": BOT_USERNAME,
+                    },
                 },
-                "capture": True,
-                "description": description,
-                "metadata": {
-                    "created_by": str(user.id),
-                    "created_by_name": user_name,
-                    "bot": BOT_USERNAME,
-                },
-            },
-            idempotency_key,
+                idempotency_key,
+            )
         )
 
         payment_url = yoo_payment.confirmation.confirmation_url
@@ -644,7 +860,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Дополнительно проверим актуальный статус в ЮKassa
     try:
-        yoo = Payment.find_one(payment_id)
+        loop = asyncio.get_running_loop()
+        yoo = await loop.run_in_executor(None, Payment.find_one, payment_id)
         if yoo.status != p["status"]:
             db.update_payment_status(payment_id, yoo.status)
             p = db.get_payment(payment_id)
@@ -942,26 +1159,124 @@ async def post_init(application: Application):
 
 
 # ===================================================
-# HEALTH CHECK (опционально, для мониторинга)
+# HEALTH CHECK И МОНИТОРИНГ
 # ===================================================
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Простая проверка что бот жив."""
+    """Улучшенная проверка состояния бота."""
     if not db.is_allowed(update.effective_user.id):
         return
 
     stats = db.get_today_stats()
     pending = db.get_pending_payments()
+    task_stats = task_manager.get_stats()
+
+    # Проверяем работоспособность БД
+    try:
+        db_health = "✅"
+        with db._connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+    except Exception:
+        db_health = "❌"
 
     await update.message.reply_text(
-        f"🏓 Pong!\n\n"
+        f"🏓 <b>Статус бота</b>\n\n"
         f"⏱ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"🗄️ База данных: {db_health}\n"
         f"⏳ Активных платежей: {len(pending)}\n"
-        f"✅ Оплат сегодня: {stats['paid']}",
+        f"📊 Статистика задач:\n"
+        f"  • Активные: {task_stats['active_tasks']}\n"
+        f"  • Отслеживание платежей: {task_stats['payment_watchers']}/{task_stats['max_watchers']}\n"
+        f"✅ Оплачено сегодня: {stats['paid']}\n"
+        f"💰 Сумма оплат: {stats['paid_sum']:.2f} ₽",
+        parse_mode="HTML",
     )
 
 
+async def cmd_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Расширенная системная информация (только для админа)."""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Только для администратора")
+        return
+
+    import psutil
+    import sys
+    
+    # Системная информация
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    
+    task_stats = task_manager.get_stats()
+    
+    # Проверяем долгие задачи
+    long_running_tasks = []
+    for payment_id, task in task_manager._payment_watchers.items():
+        if not task.done():
+            # Здесь можно добавить логику отслеживания времени выполнения
+            long_running_tasks.append(f"• {payment_id}")
+    
+    system_info = (
+        f"🖥️ <b>Системная информация</b>\n\n"
+        f"💾 RAM: {memory.percent}% ({memory.used // 1024 // 1024}MB/{memory.total // 1024 // 1024}MB)\n"
+        f"💽 Диск: {disk.percent}% ({disk.used // 1024 // 1024 // 1024}GB/{disk.total // 1024 // 1024 // 1024}GB)\n"
+        f"🐍 Python: {sys.version.split()[0]}\n"
+        f"⚡ Процессов: {len(psutil.pids())}\n\n"
+        f"📊 <b>Задачи бота</b>\n"
+        f"• Активные задачи: {task_stats['active_tasks']}\n"
+        f"• Отслеживание платежей: {task_stats['payment_watchers']}\n"
+        f"• Максимум отслеживания: {task_stats['max_watchers']}\n"
+    )
+    
+    if long_running_tasks:
+        system_info += f"\n🔄 <b>Долгие задачи</b>:\n" + "\n".join(long_running_tasks[:5])
+        if len(long_running_tasks) > 5:
+            system_info += f"\n... и еще {len(long_running_tasks) - 5}"
+
+    await update.message.reply_text(system_info, parse_mode="HTML")
+
+
 # ===================================================
-# ЗАПУСК
+# ГРАЦИОЗНЫЙ ЗАВЕРШЕНИЕ
+# ===================================================
+class BotShutdown:
+    """Управляет gracious shutdown бота."""
+    
+    def __init__(self):
+        self.shutdown_requested = False
+        
+    async def signal_handler(self, signum, frame):
+        """Обработчик сигналов для graceful shutdown."""
+        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        self.shutdown_requested = True
+        await self.shutdown()
+    
+    async def shutdown(self):
+        """Выполняет graceful shutdown всех компонентов."""
+        logger.info("🔄 Starting graceful shutdown...")
+        
+        try:
+            # 1. Останавливаем task manager
+            await task_manager.shutdown()
+            
+            # 2. Закрываем соединения с БД
+            if hasattr(db, '_connection_pool'):
+                for conn in db._connection_pool:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                db._connection_pool.clear()
+            
+            logger.info("✅ Graceful shutdown completed")
+            
+        except Exception as e:
+            logger.error(f"❌ Error during shutdown: {e}")
+
+
+shutdown_manager = BotShutdown()
+
+
+# ===================================================
+# ЗАПУСК С УЛУЧШЕННОЙ ОБРАБОТКОЙ
 # ===================================================
 def main():
     logger.info("=" * 50)
@@ -972,6 +1287,11 @@ def main():
     if TELEGRAM_PROXY_URL:
         logger.info(f"Proxy: {TELEGRAM_PROXY_URL}")
     logger.info("=" * 50)
+
+    # Устанавливаем обработчики сигналов
+    import signal
+    signal.signal(signal.SIGINT, lambda s, f: asyncio.create_task(shutdown_manager.signal_handler(s, f)))
+    signal.signal(signal.SIGTERM, lambda s, f: asyncio.create_task(shutdown_manager.signal_handler(s, f)))
 
     # ✅ Настройка с прокси
     builder = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init)
@@ -990,6 +1310,7 @@ def main():
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("system", cmd_system))
 
     # Админ-команды
     app.add_handler(CommandHandler("adduser", cmd_adduser))
@@ -1006,10 +1327,19 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("🤖 Bot is running. Press Ctrl+C to stop.")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    
+    try:
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+    except KeyboardInterrupt:
+        logger.info("🛑 Received interrupt signal")
+    finally:
+        # Гарантированный shutdown
+        if not shutdown_manager.shutdown_requested:
+            logger.info("🔄 Running final shutdown...")
+            asyncio.run(shutdown_manager.shutdown())
 
 
 if __name__ == "__main__":
